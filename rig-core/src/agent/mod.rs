@@ -116,6 +116,7 @@ pub use builder::{AgentBuilder, AgentBuilderSimple};
 pub use completion::Agent;
 pub use prompt_request::PromptHook;
 pub use prompt_request::streaming::{
-    FinalResponse, MultiTurnStreamItem, StreamingPromptRequest, stream_to_stdout,
+    FinalResponse, MultiTurnStreamItem, StreamingPromptHook, StreamingPromptRequest,
+    stream_to_stdout,
 };
 pub use prompt_request::{CancelSignal, PromptRequest, PromptResponse};
