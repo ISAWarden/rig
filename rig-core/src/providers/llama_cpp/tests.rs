@@ -2,10 +2,9 @@
 mod tests {
     use crate::providers::llama_cpp::Client;
     use crate::client::completion::CompletionClient;
-    use crate::completion::request::Prompt;
+    use crate::completion::{Prompt, CompletionRequest};
     use crate::completion::request::CompletionModel as CompletionModelTrait;
-    use crate::agent::AgentBuilder;
-    use crate::completion::CompletionRequest;
+    use crate::agent::{AgentBuilder, Agent};
     use crate::tool::Tool;
     use rig::rig_tool;
     use std::process::{Command, Child};
@@ -265,5 +264,63 @@ mod tests {
                 "Response should mention Paris. Got: {}", response_text);
         
         println!("Basic completion test completed successfully!");
+    }
+
+    #[tokio::test]
+    #[ignore] // Use `cargo test -- --ignored` to run this test
+    async fn test_llama_cpp_calculator_tool_streaming() {
+        // Initialize logging
+        INIT.call_once(|| {
+            // Skip env_logger for now to avoid dependency issues
+        });
+
+        // Check if server is running, start it if needed
+        let _server_child = if !is_server_running().await {
+            Some(start_server().await.expect("Failed to start server"))
+        } else {
+            println!("Server is already running");
+            // Wait for model to be ready if server is already running
+            println!("Waiting for model to be ready...");
+            for _ in 0..60 {
+                sleep(Duration::from_secs(2)).await;
+                if is_model_ready().await {
+                    println!("Model is ready!");
+                    break;
+                }
+            }
+            None
+        };
+
+        // Create the LlamaCpp client
+        let client = Client::new();
+        
+        // Create the completion model
+        let model = client.completion_model("qwen3-8b");
+        
+        // Create an agent with the calculator tool
+        let agent = AgentBuilder::new(model)
+            .tool(calculator_tool())
+            .preamble("You are a helpful assistant that can perform calculations using the calculator tool when needed.")
+            .build();
+
+        // Test a simple calculation with streaming
+        let prompt = "What is 15 + 27? Please use the calculator tool to find the answer.";
+        
+        println!("Starting streaming test with prompt: {}", prompt);
+        
+        // Create a streaming request
+        let mut stream = agent.stream_prompt(prompt).await.expect("Failed to create stream");
+        
+        // Stream to stdout
+        use rig::agent::stream_to_stdout;
+        let result = stream_to_stdout(&mut stream).await.expect("Failed to stream to stdout");
+        
+        println!("\nStreaming test completed successfully!");
+        println!("Final result: {:?}", result);
+        
+        // Verify the result contains the correct answer
+        let result_text = format!("{:?}", result);
+        assert!(result_text.contains("42") || result_text.contains("forty-two"),
+                "Result should contain the correct answer (42). Got: {}", result_text);
     }
 }
