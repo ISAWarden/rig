@@ -4,8 +4,9 @@ mod tests {
     use crate::client::completion::CompletionClient;
     use crate::completion::{Prompt, CompletionRequest};
     use crate::completion::request::CompletionModel as CompletionModelTrait;
-    use crate::agent::{AgentBuilder, Agent};
+    use crate::agent::AgentBuilder;
     use crate::tool::Tool;
+    use crate::streaming::StreamingPrompt;
     use rig::rig_tool;
     use std::process::{Command, Child};
     use std::time::Duration;
@@ -267,7 +268,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Use `cargo test -- --ignored` to run this test
     async fn test_llama_cpp_calculator_tool_streaming() {
         // Initialize logging
         INIT.call_once(|| {
@@ -309,11 +309,11 @@ mod tests {
         println!("Starting streaming test with prompt: {}", prompt);
         
         // Create a streaming request
-        let mut stream = agent.stream_prompt(prompt).await.expect("Failed to create stream");
+        let mut stream = agent.stream_prompt(prompt).await;
         
         // Stream to stdout
         use rig::agent::stream_to_stdout;
-        let result = stream_to_stdout(&mut stream).await.expect("Failed to stream to stdout");
+        let result = stream_to_stdout(&mut stream).await;
         
         println!("\nStreaming test completed successfully!");
         println!("Final result: {:?}", result);

@@ -3,6 +3,7 @@ use rig::providers::llama_cpp;
 use rig::client::CompletionClient;
 use rig::completion::Prompt;
 use rig::agent::Agent;
+use rig::streaming::StreamingPrompt;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Sending prompt: {}", prompt);
     println!("--- Streaming Response ---");
     
-    let mut stream = agent.stream_prompt(prompt).await?;
+    let mut stream = agent.stream_prompt(prompt).await;
     
     // Stream the response to stdout
     let result = stream_to_stdout(&mut stream).await?;

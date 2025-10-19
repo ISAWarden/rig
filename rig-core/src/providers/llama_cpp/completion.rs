@@ -3,15 +3,26 @@ use crate::completion::{
     CompletionError, CompletionRequest as CoreCompletionRequest, GetTokenUsage,
 };
 use crate::http_client::{self, HttpClientExt};
+use crate::json_utils::{self, merge};
 use crate::message::{AudioMediaType, DocumentSourceKind, ImageDetail, MimeType};
 use crate::one_or_many::string_or_one_or_many;
+use crate::streaming;
+use crate::streaming::RawStreamingChoice;
 use crate::telemetry::{ProviderResponseExt, SpanCombinator};
-use crate::{OneOrMany, completion, json_utils, message};
+use crate::{OneOrMany, completion, message};
+use async_stream::stream;
+use futures::StreamExt;
+use reqwest::RequestBuilder;
+use reqwest_eventsource::Event;
+use reqwest_eventsource::RequestBuilderExt;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt;
-use tracing::{Instrument, info_span};
 use std::str::FromStr;
+use tracing::{debug, info_span};
+use tracing_futures::Instrument;
 
 /// `qwen2.5` completion model
 pub const QWEN2_5: &str = "qwen2.5";
@@ -99,9 +110,9 @@ impl From<AssistantContent> for completion::AssistantContent {
         match value {
             AssistantContent::Text { text } => completion::AssistantContent::text(text),
             AssistantContent::Refusal { refusal } => completion::AssistantContent::text(refusal),
-            AssistantContent::Reasoning { reasoning } => {
-                completion::AssistantContent::Reasoning(completion::message::Reasoning::new(&reasoning))
-            }
+            AssistantContent::Reasoning { reasoning } => completion::AssistantContent::Reasoning(
+                completion::message::Reasoning::new(&reasoning),
+            ),
         }
     }
 }
@@ -360,6 +371,9 @@ impl TryFrom<message::Message> for Vec<Message> {
                             message::AssistantContent::Text(text) => texts.push(text),
                             message::AssistantContent::ToolCall(tool_call) => tools.push(tool_call),
                             message::AssistantContent::Reasoning(reasoning_data) => {
+                                {
+                                    println!("kankerdennis2");
+                                }
                                 reasoning.push(reasoning_data)
                             }
                         }
@@ -368,7 +382,7 @@ impl TryFrom<message::Message> for Vec<Message> {
                 );
 
                 let mut assistant_contents = Vec::new();
-                
+
                 // Add reasoning content if present
                 if !reasoning_content.is_empty() {
                     let reasoning_text = reasoning_content
@@ -380,7 +394,7 @@ impl TryFrom<message::Message> for Vec<Message> {
                         reasoning: reasoning_text,
                     });
                 }
-                
+
                 // Add text content
                 assistant_contents.extend(
                     text_content
@@ -452,14 +466,18 @@ impl TryFrom<Message> for message::Message {
                             message::AssistantContent::text(refusal)
                         }
                         AssistantContent::Reasoning { reasoning } => {
-                            message::AssistantContent::Reasoning(message::Reasoning::new(&reasoning))
+                            message::AssistantContent::Reasoning(message::Reasoning::new(
+                                &reasoning,
+                            ))
                         }
                     })
                     .collect::<Vec<_>>();
 
                 // Add reasoning from the reasoning field if present
                 if let Some(reasoning_text) = reasoning {
-                    content.push(message::AssistantContent::Reasoning(message::Reasoning::new(&reasoning_text)));
+                    content.push(message::AssistantContent::Reasoning(
+                        message::Reasoning::new(&reasoning_text),
+                    ));
                 }
 
                 content.extend(
@@ -615,7 +633,9 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                 // Add reasoning content if present
                 if let Some(reasoning_text) = reasoning {
                     if !reasoning_text.is_empty() {
-                        content.push(completion::AssistantContent::Reasoning(message::Reasoning::new(&reasoning_text)));
+                        content.push(completion::AssistantContent::Reasoning(
+                            message::Reasoning::new(&reasoning_text),
+                        ));
                     }
                 }
 
@@ -876,14 +896,55 @@ impl CompletionModel<reqwest::Client> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// ================================================================
+// LlamaCpp Completion Streaming API
+// ================================================================
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct StreamingFunction {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub arguments: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct StreamingToolCall {
+    pub index: usize,
+    pub id: Option<String>,
+    pub function: StreamingFunction,
+}
+
+#[derive(Deserialize, Debug)]
+struct StreamingDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default, deserialize_with = "json_utils::null_or_vec")]
+    tool_calls: Vec<StreamingToolCall>,
+}
+
+#[derive(Deserialize, Debug)]
+struct StreamingChoice {
+    delta: StreamingDelta,
+}
+
+#[derive(Deserialize, Debug)]
+struct StreamingCompletionChunk {
+    choices: Vec<StreamingChoice>,
+    usage: Option<Usage>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StreamingCompletionResponse {
-    // Empty struct for now since streaming is not implemented
+    pub usage: Usage,
 }
 
 impl GetTokenUsage for StreamingCompletionResponse {
     fn token_usage(&self) -> Option<crate::completion::Usage> {
-        None
+        let mut usage = crate::completion::Usage::new();
+        usage.input_tokens = self.usage.prompt_tokens as u64;
+        usage.output_tokens = self.usage.total_tokens as u64 - self.usage.prompt_tokens as u64;
+        usage.total_tokens = self.usage.total_tokens as u64;
+        Some(usage)
     }
 }
 
@@ -957,14 +1018,210 @@ impl completion::CompletionModel for CompletionModel<reqwest::Client> {
     #[cfg_attr(feature = "worker", worker::send)]
     async fn stream(
         &self,
-        _request: CoreCompletionRequest,
+        completion_request: CoreCompletionRequest,
     ) -> Result<
         crate::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
         CompletionError,
     > {
-        // Streaming not implemented yet for LlamaCpp
-        Err(CompletionError::ProviderError(
-            "Streaming not yet implemented for LlamaCpp provider".to_string(),
-        ))
+        let request = CompletionRequest::try_from((self.model.to_owned(), completion_request))?;
+        let request_messages = serde_json::to_string(&request.messages)
+            .expect("Converting to JSON from a Rust struct shouldn't fail");
+        let mut request_as_json = serde_json::to_value(request).expect("this should never fail");
+
+        request_as_json = merge(
+            request_as_json,
+            json!({"stream": true, "stream_options": {"include_usage": true}}),
+        );
+
+        let builder = self
+            .client
+            .post_reqwest("/chat/completions")
+            .json(&request_as_json);
+
+        let span = if tracing::Span::current().is_disabled() {
+            info_span!(
+                target: "rig::completions",
+                "chat",
+                gen_ai.operation.name = "chat",
+                gen_ai.provider.name = "llama_cpp",
+                gen_ai.request.model = self.model,
+                gen_ai.response.id = tracing::field::Empty,
+                gen_ai.response.model = self.model,
+                gen_ai.usage.output_tokens = tracing::field::Empty,
+                gen_ai.usage.input_tokens = tracing::field::Empty,
+                gen_ai.input.messages = request_messages,
+                gen_ai.output.messages = tracing::field::Empty,
+            )
+        } else {
+            tracing::Span::current()
+        };
+
+        tracing::Instrument::instrument(send_compatible_streaming_request(builder), span).await
     }
+}
+
+pub async fn send_compatible_streaming_request(
+    request_builder: RequestBuilder,
+) -> Result<streaming::StreamingCompletionResponse<StreamingCompletionResponse>, CompletionError> {
+    let span = tracing::Span::current();
+    // Build the request with proper headers for SSE
+    let mut event_source = request_builder
+        .eventsource()
+        .expect("Cloning request must always succeed");
+
+    let stream = stream! {
+        let span = tracing::Span::current();
+        let mut final_usage = Usage::new();
+
+        // Track in-progress tool calls
+        let mut tool_calls: HashMap<usize, (String, String, String)> = HashMap::new();
+
+        let mut text_content = String::new();
+
+        while let Some(event_result) = event_source.next().await {
+            match event_result {
+                Ok(Event::Open) => {
+                    tracing::trace!("SSE connection opened");
+                    continue;
+                }
+                Ok(Event::Message(message)) => {
+                    if message.data.trim().is_empty() || message.data == "[DONE]" {
+                        continue;
+                    }
+
+                    println!("kankerdennis3: {}", message.data);
+                    // kankerdennis3: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":" I"}}],"created":1760873067,"id":"chatcmpl-Ms92NrkOH8jnDHU4gcXtQw7GEtr5umnD","model":"qwen3-8b","system_fingerprint":"b6785-9ad4f193","object":"chat.completion.chunk"}
+                    let data = serde_json::from_str::<StreamingCompletionChunk>(&message.data);
+                    let Ok(data) = data else {
+                        let err = data.unwrap_err();
+                        debug!("Couldn't serialize data as StreamingCompletionChunk: {:?}", err);
+                        continue;
+                    };
+
+                    if let Some(choice) = data.choices.first() {
+                        let delta = &choice.delta;
+
+                        // Tool calls
+                        if !delta.tool_calls.is_empty() {
+                            for tool_call in &delta.tool_calls {
+                                let function = tool_call.function.clone();
+
+                                // Start of tool call
+                                if function.name.is_some() && function.arguments.is_empty() {
+                                    let id = tool_call.id.clone().unwrap_or_default();
+                                    tool_calls.insert(
+                                        tool_call.index,
+                                        (id, function.name.clone().unwrap(), "".to_string()),
+                                    );
+                                }
+                                // tool call partial (ie, a continuation of a previously received tool call)
+                                // name: None or Empty String
+                                // arguments: Some(String)
+                                else if function.name.clone().is_none_or(|s| s.is_empty())
+                                    && !function.arguments.is_empty()
+                                {
+                                    if let Some((id, name, arguments)) =
+                                        tool_calls.get(&tool_call.index)
+                                    {
+                                        let new_arguments = &tool_call.function.arguments;
+                                        let arguments = format!("{arguments}{new_arguments}");
+                                        tool_calls.insert(
+                                            tool_call.index,
+                                            (id.clone(), name.clone(), arguments),
+                                        );
+                                    } else {
+                                        debug!("Partial tool call received but tool call was never started.");
+                                    }
+                                }
+                                // Complete tool call
+                                else {
+                                    let id = tool_call.id.clone().unwrap_or_default();
+                                    let name = function.name.expect("tool call should have a name");
+                                    let arguments = function.arguments;
+                                    let Ok(arguments) = serde_json::from_str(&arguments) else {
+                                        debug!("Couldn't serialize '{arguments}' as JSON");
+                                        continue;
+                                    };
+
+                                    yield Ok(streaming::RawStreamingChoice::ToolCall {
+                                        id,
+                                        name,
+                                        arguments,
+                                        call_id: None,
+                                    });
+                                }
+                            }
+                        }
+
+                        // Message content
+                        println!("kankerden: {:#?}", choice);
+                        if let Some(content) = &choice.delta.content {
+                            text_content += content;
+                            yield Ok(streaming::RawStreamingChoice::Message(content.clone()))
+                        }
+                    }
+
+                    // Usage updates
+                    if let Some(usage) = data.usage {
+                        final_usage = usage.clone();
+                    }
+                }
+                Err(reqwest_eventsource::Error::StreamEnded) => {
+                    break;
+                }
+                Err(error) => {
+                    tracing::error!(?error, "SSE error");
+                    yield Err(CompletionError::ResponseError(error.to_string()));
+                    break;
+                }
+            }
+        }
+
+        // Ensure event source is closed when stream ends
+        event_source.close();
+
+        let mut vec_toolcalls = vec![];
+
+        // Flush any tool calls that weren't fully yielded
+        for (_, (id, name, arguments)) in tool_calls {
+            let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&arguments) else {
+                continue;
+            };
+
+            vec_toolcalls.push(ToolCall {
+                r#type: ToolType::Function,
+                id: id.clone(),
+                function: Function {
+                    name: name.clone(), arguments: arguments.clone()
+                },
+            });
+
+            yield Ok(RawStreamingChoice::ToolCall {
+                id,
+                name,
+                arguments,
+                call_id: None,
+            });
+        }
+
+        let message_output = Message::Assistant {
+            content: vec![AssistantContent::Text { text: text_content }],
+            refusal: None,
+            reasoning: None,
+            name: None,
+            tool_calls: vec_toolcalls
+        };
+
+        span.record("gen_ai.usage.input_tokens", final_usage.prompt_tokens);
+        span.record("gen_ai.usage.output_tokens", final_usage.total_tokens - final_usage.prompt_tokens);
+        span.record("gen_ai.output.messages", serde_json::to_string(&vec![message_output]).expect("Converting from a Rust struct should always convert to JSON without failing"));
+
+        yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
+            usage: final_usage.clone()
+        }));
+    }.instrument(span);
+
+    Ok(streaming::StreamingCompletionResponse::stream(Box::pin(
+        stream,
+    )))
 }
