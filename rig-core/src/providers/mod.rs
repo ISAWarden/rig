@@ -11,6 +11,7 @@
 //! - DeepSeek
 //! - Azure OpenAI
 //! - Mira
+//! - LlamaCpp
 //!
 //! Each provider has its own module, which contains a `Client` implementation that can
 //! be used to initialize completion and embedding models and execute requests to those models.
@@ -45,6 +46,26 @@
 //! ```
 //! Note: The example above uses the OpenAI provider client, but the same pattern can
 //! be used with the Cohere provider client.
+//!
+//! # Example with LlamaCpp
+//! ```
+//! use rig::{providers::llama_cpp, agent::AgentBuilder};
+//!
+//! // Initialize the LlamaCpp client
+//! let llama_cpp = llama_cpp::Client::new("http://localhost:8402");
+//!
+//! // Create a model and initialize an agent
+//! let model = llama_cpp.completion_model("Qwen3-8B-Q8_0.gguf");
+//!
+//! let agent = AgentBuilder::new(model)
+//!     .preamble("You are a helpful assistant.")
+//!     .build();
+//!
+//! // Alternatively, you can initialize an agent directly
+//! let agent = llama_cpp.agent("Qwen3-8B-Q8_0.gguf")
+//!     .preamble("You are a helpful assistant.")
+//!     .build();
+//! ```
 pub mod anthropic;
 pub mod azure;
 pub mod cohere;
@@ -54,6 +75,7 @@ pub mod gemini;
 pub mod groq;
 pub mod huggingface;
 pub mod hyperbolic;
+pub mod llama_cpp;
 pub mod mira;
 pub mod mistral;
 pub mod moonshot;
