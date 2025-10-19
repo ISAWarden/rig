@@ -335,12 +335,8 @@ where
                             }
                         },
                         Ok(StreamedAssistantContent::Reasoning(rig::message::Reasoning { reasoning, id, signature })) => {
-                            chat_history.write().await.push(rig::message::Message::Assistant {
-                                id: None,
-                                content: OneOrMany::one(AssistantContent::Reasoning(Reasoning {
-                                    reasoning: reasoning.clone(), id: id.clone(), signature: signature.clone()
-                                }))
-                            });
+                            // Don't add reasoning chunks to chat history to avoid bloating the conversation
+                            // with too many reasoning messages that cause 500 errors with LlamaCpp
                             yield Ok(MultiTurnStreamItem::stream_item(StreamedAssistantContent::Reasoning(rig::message::Reasoning { reasoning, id, signature })));
                             did_call_tool = false;
                         },
@@ -451,11 +447,11 @@ pub async fn stream_to_stdout<R>(
                 std::io::Write::flush(&mut std::io::stdout()).unwrap();
             }
             Ok(MultiTurnStreamItem::StreamItem(StreamedAssistantContent::Reasoning(
-                Reasoning { reasoning, .. },
+                Reasoning { reasoning: _, .. },
             ))) => {
-                let reasoning = reasoning.join("\n");
-                print!("{reasoning}");
-                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                // let reasoning = reasoning.join("\n");
+                // print!("{reasoning}");
+                // std::io::Write::flush(&mut std::io::stdout()).unwrap();
             }
             Ok(MultiTurnStreamItem::FinalResponse(res)) => {
                 final_res = res;

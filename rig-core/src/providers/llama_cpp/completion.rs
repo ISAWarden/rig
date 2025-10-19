@@ -251,27 +251,46 @@ impl TryFrom<message::Message> for Vec<Message> {
                     .partition(|content| matches!(content, message::UserContent::ToolResult(_)));
 
                 if !tool_results.is_empty() {
-                    tool_results
-                        .into_iter()
-                        .map(|content| match content {
+                    // Convert tool results to user messages for LlamaCpp compatibility
+                    let mut user_messages = vec![];
+                    for other_content_item in other_content {
+                        user_messages.push(Ok::<_, message::MessageError>(UserContent::Text {
+                            text: match other_content_item {
+                                message::UserContent::Text(message::Text { text }) => text,
+                                _ => "".to_string(),
+                            }
+                        }));
+                    }
+                    
+                    for content in tool_results {
+                        match content {
                             message::UserContent::ToolResult(message::ToolResult {
                                 id,
                                 content,
                                 ..
-                            }) => Ok::<_, message::MessageError>(Message::ToolResult {
-                                tool_call_id: id,
-                                content: content.try_map(|content| match content {
-                                    message::ToolResultContent::Text(message::Text { text }) => {
-                                        Ok(text.into())
-                                    }
-                                    _ => Err(message::MessageError::ConversionError(
-                                        "Tool result content does not support non-text".into(),
-                                    )),
-                                })?,
-                            }),
+                            }) => {
+                                let tool_result_text = content.iter()
+                                    .map(|c| match c {
+                                        message::ToolResultContent::Text(message::Text { text }) => text.clone(),
+                                        _ => "".to_string(),
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("");
+                                
+                                user_messages.push(Ok(UserContent::Text {
+                                    text: format!("Tool {} returned: {}", id, tool_result_text)
+                                }));
+                            }
                             _ => unreachable!(),
-                        })
-                        .collect::<Result<Vec<_>, _>>()
+                        }
+                    }
+                    
+                    let user_content = user_messages.into_iter().collect::<Result<Vec<_>, _>>()?;
+                    
+                    Ok(vec![Message::User {
+                        content: OneOrMany::many(user_content).expect("There should be at least one tool result"),
+                        name: None,
+                    }])
                 } else {
                     let other_content: Vec<UserContent> = other_content
                         .into_iter()
@@ -371,9 +390,6 @@ impl TryFrom<message::Message> for Vec<Message> {
                             message::AssistantContent::Text(text) => texts.push(text),
                             message::AssistantContent::ToolCall(tool_call) => tools.push(tool_call),
                             message::AssistantContent::Reasoning(reasoning_data) => {
-                                {
-                                    println!("kankerdennis2");
-                                }
                                 reasoning.push(reasoning_data)
                             }
                         }
@@ -918,6 +934,8 @@ pub struct StreamingToolCall {
 struct StreamingDelta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default, deserialize_with = "json_utils::null_or_vec")]
     tool_calls: Vec<StreamingToolCall>,
 }
@@ -1026,6 +1044,10 @@ impl completion::CompletionModel for CompletionModel<reqwest::Client> {
         let request = CompletionRequest::try_from((self.model.to_owned(), completion_request))?;
         let request_messages = serde_json::to_string(&request.messages)
             .expect("Converting to JSON from a Rust struct shouldn't fail");
+        
+        // Debug: Print the request messages to see what's being sent
+        eprintln!("DEBUG: Streaming request messages: {}", request_messages);
+        
         let mut request_as_json = serde_json::to_value(request).expect("this should never fail");
 
         request_as_json = merge(
@@ -1077,6 +1099,7 @@ pub async fn send_compatible_streaming_request(
         let mut tool_calls: HashMap<usize, (String, String, String)> = HashMap::new();
 
         let mut text_content = String::new();
+        let mut reasoning_content = String::new();
 
         while let Some(event_result) = event_source.next().await {
             match event_result {
@@ -1089,8 +1112,6 @@ pub async fn send_compatible_streaming_request(
                         continue;
                     }
 
-                    println!("kankerdennis3: {}", message.data);
-                    // kankerdennis3: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":" I"}}],"created":1760873067,"id":"chatcmpl-Ms92NrkOH8jnDHU4gcXtQw7GEtr5umnD","model":"qwen3-8b","system_fingerprint":"b6785-9ad4f193","object":"chat.completion.chunk"}
                     let data = serde_json::from_str::<StreamingCompletionChunk>(&message.data);
                     let Ok(data) = data else {
                         let err = data.unwrap_err();
@@ -1133,11 +1154,21 @@ pub async fn send_compatible_streaming_request(
                                         debug!("Partial tool call received but tool call was never started.");
                                     }
                                 }
-                                // Complete tool call
-                                else {
+                                // Complete tool call - this happens when we have both name and arguments
+                                // but this is the last chunk for this tool call
+                                else if function.name.is_some() && !function.arguments.is_empty() {
                                     let id = tool_call.id.clone().unwrap_or_default();
-                                    let name = function.name.expect("tool call should have a name");
-                                    let arguments = function.arguments;
+                                    let name = function.name.clone().unwrap();
+                                    let mut arguments = function.arguments;
+                                    
+                                    // If we already have a partial tool call, append the arguments
+                                    if let Some((_existing_id, _existing_name, existing_args)) =
+                                        tool_calls.get(&tool_call.index)
+                                    {
+                                        arguments = format!("{}{}", existing_args, arguments);
+                                        tool_calls.remove(&tool_call.index);
+                                    }
+                                    
                                     let Ok(arguments) = serde_json::from_str(&arguments) else {
                                         debug!("Couldn't serialize '{arguments}' as JSON");
                                         continue;
@@ -1150,14 +1181,36 @@ pub async fn send_compatible_streaming_request(
                                         call_id: None,
                                     });
                                 }
+                                // Handle the case where we have a name but no arguments (empty tool call)
+                                else if function.name.is_some() {
+                                    let id = tool_call.id.clone().unwrap_or_default();
+                                    let name = function.name.unwrap();
+                                    let arguments = serde_json::Value::Null;
+
+                                    yield Ok(streaming::RawStreamingChoice::ToolCall {
+                                        id,
+                                        name,
+                                        arguments,
+                                        call_id: None,
+                                    });
+                                }
                             }
                         }
 
                         // Message content
-                        println!("kankerden: {:#?}", choice);
                         if let Some(content) = &choice.delta.content {
                             text_content += content;
                             yield Ok(streaming::RawStreamingChoice::Message(content.clone()))
+                        }
+
+                        // Reasoning content
+                        if let Some(reasoning) = &choice.delta.reasoning_content {
+                            reasoning_content += reasoning;
+                            yield Ok(streaming::RawStreamingChoice::Reasoning {
+                                id: None,
+                                reasoning: reasoning.clone(),
+                                signature: None,
+                            })
                         }
                     }
 
@@ -1204,10 +1257,22 @@ pub async fn send_compatible_streaming_request(
             });
         }
 
+        let mut assistant_contents = Vec::new();
+
+        // Add reasoning content if present
+        if !reasoning_content.is_empty() {
+            assistant_contents.push(AssistantContent::Reasoning {
+                reasoning: reasoning_content,
+            });
+        }
+
+        // Add text content
+        assistant_contents.push(AssistantContent::Text { text: text_content });
+
         let message_output = Message::Assistant {
-            content: vec![AssistantContent::Text { text: text_content }],
+            content: assistant_contents,
             refusal: None,
-            reasoning: None,
+            reasoning: None, // Reasoning is now in content
             name: None,
             tool_calls: vec_toolcalls
         };
