@@ -229,7 +229,7 @@ where
                     stream.reasoning = format!("{}{}", stream.reasoning, reasoning.clone());
                     Poll::Ready(Some(Ok(StreamedAssistantContent::Reasoning(Reasoning {
                         id,
-                        reasoning: vec![stream.reasoning.clone()],
+                        reasoning: vec![reasoning],
                         signature,
                     }))))
                 }
