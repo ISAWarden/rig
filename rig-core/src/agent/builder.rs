@@ -131,6 +131,31 @@ where
         self
     }
 
+    /// Add a static ToolSet to the agent
+    pub fn tools(self, tools: ToolSet) -> AgentBuilderSimple<M> {
+        let static_tools = tools
+            .tools
+            .keys()
+            .map(|t| t.to_string())
+            .collect::<Vec<String>>();
+
+        AgentBuilderSimple {
+            name: self.name,
+            description: self.description,
+            model: self.model,
+            preamble: self.preamble,
+            static_context: self.static_context,
+            static_tools,
+            additional_params: self.additional_params,
+            max_tokens: self.max_tokens,
+            dynamic_context: vec![],
+            dynamic_tools: vec![],
+            temperature: self.temperature,
+            tools,
+            tool_choice: self.tool_choice,
+        }
+    }
+
     /// Add a static tool to the agent
     pub fn tool(self, tool: impl Tool + 'static) -> AgentBuilderSimple<M> {
         let toolname = tool.name();
