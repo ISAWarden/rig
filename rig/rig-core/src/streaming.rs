@@ -260,7 +260,6 @@ where
             cx.waker().wake_by_ref();
             return Poll::Pending;
         }
-
         match Pin::new(&mut stream.inner).poll_next(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => {
@@ -289,61 +288,63 @@ where
                 }
                 Poll::Ready(Some(Err(err)))
             }
-            Poll::Ready(Some(Ok(choice))) => match choice {
-                RawStreamingChoice::Message(text) => {
-                    // Forward the streaming tokens to the outer stream
-                    // and concat the text together
-                    stream.text = format!("{}{}", stream.text, text);
-                    Poll::Ready(Some(Ok(StreamedAssistantContent::text(&text))))
-                }
-                RawStreamingChoice::ToolCallDelta { id, content } => {
-                    Poll::Ready(Some(Ok(StreamedAssistantContent::ToolCallDelta {
-                        id,
-                        content,
-                    })))
-                }
-                RawStreamingChoice::Reasoning {
-                    id,
-                    reasoning,
-                    signature,
-                } => Poll::Ready(Some(Ok(StreamedAssistantContent::Reasoning(Reasoning {
-                    id,
-                    reasoning: vec![reasoning],
-                    signature,
-                })))),
-                RawStreamingChoice::ReasoningDelta { id, reasoning } => {
-                    // Forward the streaming tokens to the outer stream
-                    // and concat the text together
-                    stream.reasoning = format!("{}{}", stream.reasoning, reasoning);
-                    Poll::Ready(Some(Ok(StreamedAssistantContent::ReasoningDelta {
+            Poll::Ready(Some(Ok(choice))) => {
+                match choice {
+                    RawStreamingChoice::Message(text) => {
+                        // Forward the streaming tokens to the outer stream
+                        // and concat the text together
+                        stream.text = format!("{}{}", stream.text, text);
+                        Poll::Ready(Some(Ok(StreamedAssistantContent::text(&text))))
+                    }
+                    RawStreamingChoice::ToolCallDelta { id, content } => {
+                        Poll::Ready(Some(Ok(StreamedAssistantContent::ToolCallDelta {
+                            id,
+                            content,
+                        })))
+                    }
+                    RawStreamingChoice::Reasoning {
                         id,
                         reasoning,
-                    })))
-                }
-                RawStreamingChoice::ToolCall(tool_call) => {
-                    // Keep track of each tool call to aggregate the final message later
-                    // and pass it to the outer stream
-                    let tool_call: ToolCall = tool_call.into();
-                    stream.tool_calls.push(tool_call.clone());
-                    Poll::Ready(Some(Ok(StreamedAssistantContent::ToolCall(tool_call))))
-                }
-                RawStreamingChoice::FinalResponse(response) => {
-                    if stream
-                        .final_response_yielded
-                        .load(std::sync::atomic::Ordering::SeqCst)
-                    {
-                        stream.poll_next_unpin(cx)
-                    } else {
-                        // Set the final response field and return the next item in the stream
-                        stream.response = Some(response.clone());
-                        stream
+                        signature,
+                    } => Poll::Ready(Some(Ok(StreamedAssistantContent::Reasoning(Reasoning {
+                        id,
+                        reasoning: vec![reasoning],
+                        signature,
+                    })))),
+                    RawStreamingChoice::ReasoningDelta { id, reasoning } => {
+                        // Forward the streaming tokens to the outer stream
+                        // and concat the text together
+                        stream.reasoning = format!("{}{}", stream.reasoning, reasoning);
+                        Poll::Ready(Some(Ok(StreamedAssistantContent::ReasoningDelta {
+                            id,
+                            reasoning,
+                        })))
+                    }
+                    RawStreamingChoice::ToolCall(tool_call) => {
+                        // Keep track of each tool call to aggregate the final message later
+                        // and pass it to the outer stream
+                        let tool_call: ToolCall = tool_call.into();
+                        stream.tool_calls.push(tool_call.clone());
+                        Poll::Ready(Some(Ok(StreamedAssistantContent::ToolCall(tool_call))))
+                    }
+                    RawStreamingChoice::FinalResponse(response) => {
+                        if stream
                             .final_response_yielded
-                            .store(true, std::sync::atomic::Ordering::SeqCst);
-                        let final_response = StreamedAssistantContent::final_response(response);
-                        Poll::Ready(Some(Ok(final_response)))
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                        {
+                            stream.poll_next_unpin(cx)
+                        } else {
+                            // Set the final response field and return the next item in the stream
+                            stream.response = Some(response.clone());
+                            stream
+                                .final_response_yielded
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            let final_response = StreamedAssistantContent::final_response(response);
+                            Poll::Ready(Some(Ok(final_response)))
+                        }
                     }
                 }
-            },
+            }
         }
     }
 }
